@@ -59,13 +59,6 @@ Results will be saved to `results/logs/` and `results/figures/`.
 - Photovoltaic production estimation
 - Multi-objective reward (cost + comfort + cycling penalty)
 
-## Team
-
-[Your Group Name]
-- Member 1
-- Member 2
-- Member 3
-
 ## License
 
 MIT License - See LICENSE file for details.
