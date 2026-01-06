@@ -14,14 +14,23 @@ venv/
 *.swo
 .DS_Store
 Thumbs.db
-results/logs/*.csv
-results/logs/*.json
-results/figures/*.png
-results/figures/*.pdf
+# Results
+results/logs/*
+results/figures/*
+!results/logs/.gitkeep
+!results/figures/.gitkeep
+
+
+# Data files (trop gros)
+data/raw/*
 data/offline_dataset/*
+!data/raw/.gitkeep
 !data/offline_dataset/.gitkeep
 .pytest_cache/
 .coverage
 *.log
 runs/
 wandb/
+
+# Notebooks
+.ipynb_checkpoints/
