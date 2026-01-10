@@ -40,19 +40,23 @@ class ReplayBuffer:
 
 
 class Actor(nn.Module):
-    """Actor network (deterministic policy)."""
-    
-    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256, max_action: float = 1.0):
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256,
+                 action_low: np.ndarray = np.array([12., 23.25, -1.]),
+                 action_high: np.ndarray = np.array([23.25, 30., 1.])):
         super().__init__()
         self.fc1 = nn.Linear(state_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc3 = nn.Linear(hidden_dim, action_dim)
-        self.max_action = max_action
-    
+        
+        self.action_low = torch.FloatTensor(action_low)
+        self.action_scale = (torch.FloatTensor(action_high) - self.action_low) / 2.0
+        self.action_bias = (torch.FloatTensor(action_high) + self.action_low) / 2.0
+
     def forward(self, state):
         x = torch.relu(self.fc1(state))
         x = torch.relu(self.fc2(x))
-        action = torch.tanh(self.fc3(x)) * self.max_action
+        action_tanh = torch.tanh(self.fc3(x))
+        action = action_tanh * self.action_scale + self.action_bias
         return action
 
 
@@ -98,7 +102,9 @@ class TD3:
         tau: float = 0.005,
         policy_delay: int = 2,
         noise_std: float = 0.2,
-        device: str = "cpu"
+        device: str = "cpu",
+        action_low: np.ndarray = np.array([12., 23.25, -1.]),
+        action_high: np.ndarray = np.array([23.25, 30., 1.])
     ):
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -109,10 +115,22 @@ class TD3:
         self.device = torch.device(device)
         self.update_step = 0
         
-        # Networks
-        self.actor = Actor(state_dim, action_dim, hidden_dim).to(self.device)
+        # ⭐ Stocker les bornes pour select_action
+        self.action_low = torch.FloatTensor(action_low).to(self.device)
+        self.action_high = torch.FloatTensor(action_high).to(self.device)
+        
+        # ⭐ Networks avec scaling
+        self.actor = Actor(
+            state_dim, action_dim, hidden_dim,
+            action_low=action_low, action_high=action_high
+        ).to(self.device)
+        
+        self.target_actor = Actor(
+            state_dim, action_dim, hidden_dim,
+            action_low=action_low, action_high=action_high
+        ).to(self.device)
+        
         self.critic = Critic(state_dim, action_dim, hidden_dim).to(self.device)
-        self.target_actor = Actor(state_dim, action_dim, hidden_dim).to(self.device)
         self.target_critic = Critic(state_dim, action_dim, hidden_dim).to(self.device)
         
         # Copy weights
@@ -134,18 +152,22 @@ class TD3:
             )
     
     def select_action(self, state: np.ndarray, deterministic: bool = False) -> np.ndarray:
-        """Select action from policy."""
-        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-        
-        with torch.no_grad():
-            action = self.actor(state_tensor)
+            """Select action from policy."""
+            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
             
-            if not deterministic:
-                noise = np.random.normal(0, self.noise_std, self.action_dim)
-                action = action + torch.FloatTensor(noise).to(self.device)
-                action = torch.clamp(action, -1, 1)
-        
-        return action.cpu().numpy().squeeze()
+            with torch.no_grad():
+                action = self.actor(state_tensor)
+                
+                if not deterministic:
+                    noise = torch.FloatTensor(
+                        np.random.normal(0, self.noise_std, self.action_dim)
+                    ).to(self.device)
+                    action = action + noise
+                
+                # ⭐ Clamp avec les bornes stockées dans TD3
+                action = torch.clamp(action, self.action_low, self.action_high)
+            
+            return action.cpu().numpy().squeeze()
     
     def train_step(self, replay_buffer: ReplayBuffer, batch_size: int = 256):
         """One training step."""

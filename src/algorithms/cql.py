@@ -1,5 +1,5 @@
 """
-Conservative Q-Learning (CQL) - Offline RL Algorithm.
+Conservative Q-Learning (CQL) - Offline RL Algorithm avec Double Q-Learning.
 
 Reference: Kumar et al., 2020
 https://arxiv.org/abs/2006.04779
@@ -71,7 +71,7 @@ class CriticQ(nn.Module):
 
 
 class CQL:
-    """Conservative Q-Learning (Offline RL)."""
+    """Conservative Q-Learning (Offline RL) avec Double Q-Learning."""
     
     def __init__(
         self,
@@ -80,8 +80,8 @@ class CQL:
         hidden_dim: int = 256,
         learning_rate: float = 3e-4,
         gamma: float = 0.99,
-        cql_weight: float = 1.0,
-        cql_temp: float = 1.0,
+        cql_weight: float = 10.0,  # ⬆️ AUGMENTÉ de 1.0 à 10.0
+        cql_temp: float = 0.3,      # ⬇️ DIMINUÉ de 1.0 à 0.3
         num_random_actions: int = 10,
         device: str = "cpu"
     ):
@@ -93,13 +93,19 @@ class CQL:
         self.num_random_actions = num_random_actions
         self.device = torch.device(device)
         
-        # Networks
-        self.q_network = CriticQ(state_dim, action_dim, hidden_dim).to(self.device)
-        self.target_q_network = CriticQ(state_dim, action_dim, hidden_dim).to(self.device)
-        self._copy_weights(self.q_network, self.target_q_network)
+        # ⭐ DOUBLE Q-LEARNING : Deux critics au lieu d'un
+        self.q_network_1 = CriticQ(state_dim, action_dim, hidden_dim).to(self.device)
+        self.q_network_2 = CriticQ(state_dim, action_dim, hidden_dim).to(self.device)
         
-        # Optimizer
-        self.optimizer = optim.Adam(self.q_network.parameters(), lr=learning_rate)
+        self.target_q_network_1 = CriticQ(state_dim, action_dim, hidden_dim).to(self.device)
+        self.target_q_network_2 = CriticQ(state_dim, action_dim, hidden_dim).to(self.device)
+        
+        self._copy_weights(self.q_network_1, self.target_q_network_1)
+        self._copy_weights(self.q_network_2, self.target_q_network_2)
+        
+        # Optimizer pour les deux critics
+        self.optimizer_1 = optim.Adam(self.q_network_1.parameters(), lr=learning_rate)
+        self.optimizer_2 = optim.Adam(self.q_network_2.parameters(), lr=learning_rate)
     
     def _copy_weights(self, source, target):
         for target_param, param in zip(target.parameters(), source.parameters()):
@@ -112,15 +118,29 @@ class CQL:
             )
     
     def select_action(self, state: np.ndarray, deterministic: bool = True) -> np.ndarray:
-        """Select action (CQL is offline, so mostly deterministic)."""
+        """Select action (CQL is offline, deterministic action)."""
         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         
-        # Greedy action selection
-        action = np.random.uniform(-1, 1, self.action_dim)  # Placeholder
-        return action
+        with torch.no_grad():
+            # Évaluer plusieurs actions aléatoires et choisir la meilleure
+            best_q = -np.inf
+            best_action = None
+            
+            for _ in range(10):
+                action = torch.FloatTensor(np.random.uniform(-1, 1, self.action_dim)).unsqueeze(0).to(self.device)
+                # ⭐ Utiliser le min des deux Q-networks pour sélectionner l'action
+                q1 = self.q_network_1(state_tensor, action)
+                q2 = self.q_network_2(state_tensor, action)
+                q = torch.min(q1, q2).item()
+                
+                if q > best_q:
+                    best_q = q
+                    best_action = action.cpu().numpy().squeeze()
+        
+        return best_action if best_action is not None else np.random.uniform(-1, 1, self.action_dim)
     
     def train_step(self, replay_buffer: OfflineReplayBuffer, batch_size: int = 256):
-        """One training step with CQL penalty."""
+        """One training step with Double Q-Learning + CQL penalty."""
         if len(replay_buffer) < batch_size:
             return {}
         
@@ -132,48 +152,70 @@ class CQL:
         next_states = torch.FloatTensor(next_states).to(self.device)
         dones = torch.FloatTensor(dones).to(self.device)
         
-        # Compute target Q-value
+        # ⭐ DOUBLE Q-LEARNING TARGET : min(Q1_target, Q2_target)
         with torch.no_grad():
-            next_q = self.target_q_network(next_states, actions)
+            next_q1 = self.target_q_network_1(next_states, actions)
+            next_q2 = self.target_q_network_2(next_states, actions)
+            next_q = torch.min(next_q1, next_q2)  # ⭐ Min pour réduire overestimation
             target_q = rewards + (1.0 - dones) * self.gamma * next_q
         
-        # Q-learning loss
-        q_pred = self.q_network(states, actions)
-        td_loss = ((q_pred - target_q) ** 2).mean()
+        # ⭐ UPDATE Q1
+        q1_pred = self.q_network_1(states, actions)
+        td_loss_1 = ((q1_pred - target_q) ** 2).mean()
         
-        # CQL penalty: penalize Q-values on random actions
+        # CQL penalty Q1 : pénaliser Q-values sur actions aléatoires
         random_actions = torch.FloatTensor(
             np.random.uniform(-1, 1, (batch_size * self.num_random_actions, self.action_dim))
         ).to(self.device)
-        
         repeated_states = states.repeat(self.num_random_actions, 1)
-        q_random = self.q_network(repeated_states, random_actions)
+        q1_random = self.q_network_1(repeated_states, random_actions)
+        cql_penalty_1 = torch.logsumexp(q1_random / self.cql_temp, dim=0).mean()
+        cql_penalty_1 -= q1_pred.mean()
         
-        cql_penalty = torch.logsumexp(q_random / self.cql_temp, dim=0).mean()
-        cql_penalty -= q_pred.mean()
+        loss_1 = td_loss_1 + self.cql_weight * cql_penalty_1
         
-        # Combined loss
-        loss = td_loss + self.cql_weight * cql_penalty
+        self.optimizer_1.zero_grad()
+        loss_1.backward()
+        torch.nn.utils.clip_grad_norm_(self.q_network_1.parameters(), 1.0)  # ⭐ Gradient clipping
+        self.optimizer_1.step()
         
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
+        # ⭐ UPDATE Q2 (même procédure)
+        q2_pred = self.q_network_2(states, actions)
+        td_loss_2 = ((q2_pred - target_q) ** 2).mean()
         
-        # Soft update target
-        self._soft_update(self.q_network, self.target_q_network)
+        q2_random = self.q_network_2(repeated_states, random_actions)
+        cql_penalty_2 = torch.logsumexp(q2_random / self.cql_temp, dim=0).mean()
+        cql_penalty_2 -= q2_pred.mean()
+        
+        loss_2 = td_loss_2 + self.cql_weight * cql_penalty_2
+        
+        self.optimizer_2.zero_grad()
+        loss_2.backward()
+        torch.nn.utils.clip_grad_norm_(self.q_network_2.parameters(), 1.0)  # ⭐ Gradient clipping
+        self.optimizer_2.step()
+        
+        # Soft update targets
+        self._soft_update(self.q_network_1, self.target_q_network_1)
+        self._soft_update(self.q_network_2, self.target_q_network_2)
         
         return {
-            'td_loss': td_loss.item(),
-            'cql_penalty': cql_penalty.item(),
-            'total_loss': loss.item(),
+            'td_loss': ((td_loss_1 + td_loss_2) / 2).item(),
+            'cql_penalty': ((cql_penalty_1 + cql_penalty_2) / 2).item(),
+            'total_loss': ((loss_1 + loss_2) / 2).item(),
         }
     
     def save(self, path: str):
         """Save checkpoint."""
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        torch.save(self.q_network.state_dict(), path)
+        torch.save({
+            'q_network_1': self.q_network_1.state_dict(),
+            'q_network_2': self.q_network_2.state_dict(),
+        }, path)
     
     def load(self, path: str):
         """Load checkpoint."""
-        self.q_network.load_state_dict(torch.load(path))
-        self._copy_weights(self.q_network, self.target_q_network)
+        checkpoint = torch.load(path)
+        self.q_network_1.load_state_dict(checkpoint['q_network_1'])
+        self.q_network_2.load_state_dict(checkpoint['q_network_2'])
+        self._copy_weights(self.q_network_1, self.target_q_network_1)
+        self._copy_weights(self.q_network_2, self.target_q_network_2)

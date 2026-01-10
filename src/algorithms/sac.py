@@ -40,28 +40,42 @@ class ReplayBuffer:
 
 
 class Actor(nn.Module):
-    """Actor network for SAC (Gaussian policy)."""
-    
-    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256):
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256,
+                 action_low: np.ndarray = np.array([12., 23.25, -1.]),
+                 action_high: np.ndarray = np.array([23.25, 30., 1.])):
         super().__init__()
         self.fc1 = nn.Linear(state_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.mean = nn.Linear(hidden_dim, action_dim)
         self.log_std = nn.Linear(hidden_dim, action_dim)
         
+        # Bornes réelles de l'action space
+        self.action_low = torch.FloatTensor(action_low)
+        self.action_high = torch.FloatTensor(action_high)
+        self.action_scale = (self.action_high - self.action_low) / 2.0
+        self.action_bias = (self.action_high + self.action_low) / 2.0
+
     def forward(self, state):
         x = torch.relu(self.fc1(state))
         x = torch.relu(self.fc2(x))
         mean = self.mean(x)
         log_std = torch.clamp(self.log_std(x), min=-20, max=2)
         return mean, log_std
-    
+
     def sample(self, state):
         mean, log_std = self.forward(state)
         std = torch.exp(log_std)
         z = torch.randn_like(std)
         action = mean + std * z
-        return action, mean, log_std
+        
+        # Appliquer tanh puis scaling aux bornes réelles
+        action_tanh = torch.tanh(action)
+        scaled_action = action_tanh * self.action_scale + self.action_bias
+        
+        log_prob = -0.5 * (z**2 + np.log(2 * np.pi)) - log_std - torch.log(1 - action_tanh.pow(2) + 1e-6)
+        log_prob = log_prob.sum(dim=1, keepdim=True)
+        
+        return scaled_action, mean, log_std
 
 
 class Critic(nn.Module):
@@ -100,10 +114,12 @@ class SAC:
         self.gamma = gamma
         self.tau = tau
         self.alpha = alpha
-        self.device = torch.device(device)
+        self.device = torch.device(device) 
         
         # Networks
-        self.actor = Actor(state_dim, action_dim, hidden_dim).to(self.device)
+        self.actor = Actor(state_dim, action_dim, hidden_dim,
+                   action_low=np.array([12., 23.25, -1.]),
+                   action_high=np.array([23.25, 30., 1.]))
         self.critic1 = Critic(state_dim, action_dim, hidden_dim).to(self.device)
         self.critic2 = Critic(state_dim, action_dim, hidden_dim).to(self.device)
         self.target_critic1 = Critic(state_dim, action_dim, hidden_dim).to(self.device)
@@ -129,7 +145,6 @@ class SAC:
             )
     
     def select_action(self, state: np.ndarray, deterministic: bool = False) -> np.ndarray:
-        """Select action from policy."""
         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         
         with torch.no_grad():
